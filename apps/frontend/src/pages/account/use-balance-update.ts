@@ -1,4 +1,4 @@
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { createActivity } from "@/adapters";
 import { DECIMAL_PRECISION } from "@/lib/constants";
 import { ActivityCreate } from "@/lib/types";
@@ -13,6 +13,7 @@ export interface BalanceUpdateInput {
 
 export const useBalanceUpdate = (accountId: string) => {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const mutation = useMutation({
     mutationFn: async ({ currency, currentBalance, targetBalance }: BalanceUpdateInput) => {
       const difference = targetBalance - currentBalance;
@@ -51,6 +52,7 @@ export const useBalanceUpdate = (accountId: string) => {
     },
     onSuccess: (activity) => {
       if (!activity) return;
+      queryClient.invalidateQueries();
       toast({
         title: t("account:balance_edit.success"),
         variant: "default",
