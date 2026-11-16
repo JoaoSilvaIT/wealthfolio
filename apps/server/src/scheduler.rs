@@ -180,6 +180,14 @@ pub fn start_background_workers(state: Arc<AppState>) {
     // Start background broker sync scheduler (4-hour interval)
     start_broker_sync_scheduler(state.clone());
 
+    // Start PT Wealth Hub native auto-sync (Trade Republic & Hyperliquid)
+    let pt_worker = crate::pt_wealth_hub::start_pt_wealth_hub(state.clone());
+    state
+        .workers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(pt_worker);
+
     // Periodic market data sync plus portfolio update (6h interval, 2min
     // initial delay): the coordinator rebuilds whatever the sync made stale.
     let worker = crate::api::shared::spawn_periodic_update(state.clone());

@@ -11,6 +11,7 @@ mod main_lib;
 pub mod mcp;
 pub mod models;
 pub mod oidc;
+pub mod pt_wealth_hub;
 pub mod scheduler;
 mod secrets;
 pub mod static_files;
