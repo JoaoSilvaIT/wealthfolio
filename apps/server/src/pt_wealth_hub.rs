@@ -3,13 +3,19 @@
 //! Replaces external addons by running natively as a background worker
 //! in the Wealthfolio server container.
 //!
+//! Features:
+//! - Exact Trade Republic day-by-day ACT/360 interest accrual:
+//!   Calculates interest on each day's exact closing balance (supporting multiple
+//!   deposits throughout the month), maintains current month's accruing interest,
+//!   and automatically compounds/settles the payout at the start of each new month.
+//! - Hyperliquid L1 bot balance & spot sync via official info API.
+//!
 //! Configured via environment variables:
 //! - `HL_WALLET_ADDRESS`: 0x... (Hyperliquid L1 bot wallet address)
 //! - `HL_POLL_INTERVAL_SECS`: Polling interval in seconds (default: 600 = 10 min)
 //! - `HL_ACCOUNT_ID`: Optional explicit account UUID for Hyperliquid
-//! - `TR_BASE_PRINCIPAL`: Fallback base principal (e.g. "1400.00")
-//! - `TR_START_DATE`: Start date of interest accumulation (e.g. "2026-11-01")
-//! - `TR_TANB_RATE`: Annual interest rate percentage (e.g. "2.50")
+//! - `TR_BASE_PRINCIPAL`: Fallback base principal if no initial deposit exists
+//! - `TR_TANB_RATE`: Annual interest rate percentage (default: 2.50)
 //! - `TR_DISPLAY_MODE`: "gross" or "net" (after 28% IRS retention)
 //! - `TR_ACCOUNT_ID`: Optional explicit account UUID for Trade Republic
 
@@ -23,7 +29,7 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use wealthfolio_core::accounts::{Account, AccountServiceTrait, TrackingMode};
-use wealthfolio_core::activities::{ActivityStatus, NewActivity};
+use wealthfolio_core::activities::{Activity, ActivityStatus, NewActivity};
 use wealthfolio_core::portfolio::snapshot::{AccountStateSnapshot, SnapshotSource};
 use wealthfolio_core::utils::time_utils::{parse_user_timezone_or_default, user_today};
 
@@ -62,12 +68,13 @@ pub fn start_pt_wealth_hub(state: Arc<AppState>) -> tokio::task::JoinHandle<()> 
     })
 }
 
-// ─── Trade Republic Auto-Sync ────────────────────────────────────────────────
+// ─── Trade Republic Banking-Grade Accrual Engine ─────────────────────────────
 
 async fn sync_trade_republic(state: &Arc<AppState>) -> anyhow::Result<()> {
-    // If no configuration is present at all, skip quietly
     let tr_base_env = std::env::var("TR_BASE_PRINCIPAL").ok();
     let tr_acc_id_env = std::env::var("TR_ACCOUNT_ID").ok();
+
+    // Skip quietly if not configured
     if tr_base_env.is_none() && tr_acc_id_env.is_none() {
         return Ok(());
     }
@@ -87,13 +94,6 @@ async fn sync_trade_republic(state: &Arc<AppState>) -> anyhow::Result<()> {
         .clone();
     let today = user_today(parse_user_timezone_or_default(&timezone));
 
-    let start_date = std::env::var("TR_START_DATE")
-        .ok()
-        .and_then(|s| NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok())
-        .unwrap_or_else(|| {
-            NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today)
-        });
-
     let tanb_rate = std::env::var("TR_TANB_RATE")
         .ok()
         .and_then(|s| Decimal::from_str(s.trim()).ok())
@@ -112,67 +112,155 @@ async fn sync_trade_republic(state: &Arc<AppState>) -> anyhow::Result<()> {
         .activity_service
         .get_activities_by_account_id(&account.id)?;
 
-    let mut manual_sum = Decimal::ZERO;
-    let mut old_auto_tr_ids = Vec::new();
-    let mut existing_interest_amount = Decimal::ZERO;
+    let mut manual_activities: Vec<Activity> = Vec::new();
+    let mut old_temp_auto_ids = Vec::new();
+    let mut existing_temp_amount = Decimal::ZERO;
 
     for act in &activities {
-        let is_auto = act.notes.as_deref().is_some_and(|notes| {
-            notes.contains("[Auto-TR]")
-                || notes.starts_with("Ajuste de Saldo")
-                || notes.starts_with("Reset Trade Republic")
-                || notes.starts_with("Trade Republic PT50 Juros")
+        let is_payout = act
+            .notes
+            .as_deref()
+            .is_some_and(|n| n.contains("[Auto-TR-Payout]"));
+
+        let is_temp_auto = !is_payout
+            && act.notes.as_deref().is_some_and(|notes| {
+                notes.contains("[Auto-TR]")
+                    || notes.starts_with("Ajuste de Saldo")
+                    || notes.starts_with("Reset Trade Republic")
+                    || notes.starts_with("Trade Republic PT50 Juros")
+            });
+
+        if is_temp_auto {
+            old_temp_auto_ids.push(act.id.clone());
+            if let Some(amt) = act.amount {
+                existing_temp_amount = amt;
+            }
+        } else {
+            // Manual deposits, withdrawals, or previous month settled payouts
+            manual_activities.push(act.clone());
+        }
+    }
+
+    let first_of_current_month =
+        NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
+
+    // ── Step 1: Automatic Monthly Compounding Payout (on 1st of month) ─────────
+    if let Some(last_day_prev_month) = first_of_current_month.pred_opt() {
+        let prev_month_payout_note = format!(
+            "[Auto-TR-Payout] Juros Pagos Trade Republic ({:02}/{})",
+            last_day_prev_month.month(),
+            last_day_prev_month.year()
+        );
+
+        let already_paid = manual_activities.iter().any(|a| {
+            a.notes
+                .as_deref()
+                .is_some_and(|n| n.contains(&prev_month_payout_note))
         });
 
-        if is_auto {
-            old_auto_tr_ids.push(act.id.clone());
-            if let Some(amt) = act.amount {
-                existing_interest_amount += amt;
-            }
-            continue;
-        }
+        if !already_paid {
+            let first_of_prev_month =
+                NaiveDate::from_ymd_opt(last_day_prev_month.year(), last_day_prev_month.month(), 1)
+                    .unwrap_or(last_day_prev_month);
 
-        let amount = act.amount.unwrap_or(Decimal::ZERO);
-        match act.activity_type.as_str() {
-            "DEPOSIT" | "CREDIT" | "INTEREST" | "DIVIDEND" | "SELL" | "TRANSFER_IN" => {
-                manual_sum += amount;
+            let mut prev_month_interest = Decimal::ZERO;
+            let mut d = first_of_prev_month;
+
+            while d <= last_day_prev_month {
+                let bal = compute_balance_on_date(&manual_activities, d, fallback_base);
+                if bal > Decimal::ZERO {
+                    prev_month_interest +=
+                        bal * (tanb_rate / Decimal::from(100)) / Decimal::from(360);
+                }
+                if let Some(next) = d.succ_opt() {
+                    d = next;
+                } else {
+                    break;
+                }
             }
-            "WITHDRAWAL" | "FEE" | "TAX" | "BUY" | "TRANSFER_OUT" => {
-                manual_sum -= amount;
+
+            if display_mode == "net" {
+                prev_month_interest = (prev_month_interest * Decimal::new(72, 2)).round_dp(2);
+            } else {
+                prev_month_interest = prev_month_interest.round_dp(2);
             }
-            _ => {}
+
+            if prev_month_interest > Decimal::ZERO {
+                let payout_act = NewActivity {
+                    id: None,
+                    account_id: account.id.clone(),
+                    asset: None,
+                    activity_type: "INTEREST".to_string(),
+                    subtype: None,
+                    activity_date: format!(
+                        "{}T00:00:00Z",
+                        first_of_current_month.format("%Y-%m-%d")
+                    ),
+                    quantity: None,
+                    unit_price: None,
+                    currency: account.currency.clone(),
+                    fee: None,
+                    tax: None,
+                    amount: Some(prev_month_interest),
+                    status: Some(ActivityStatus::Posted),
+                    notes: Some(format!(
+                        "{} (+{:.2} {})",
+                        prev_month_payout_note, prev_month_interest, account.currency
+                    )),
+                    fx_rate: None,
+                    metadata: None,
+                    needs_review: Some(false),
+                    source_system: None,
+                    source_record_id: None,
+                    source_group_id: None,
+                    idempotency_key: None,
+                    import_run_id: None,
+                };
+
+                if let Ok(created) = state.activity_service.create_activity(payout_act).await {
+                    info!(
+                        "[PT-Wealth-Hub] Trade Republic monthly interest compounded into principal: +{:.2} {}",
+                        prev_month_interest, account.currency
+                    );
+                    manual_activities.push(created);
+                }
+            }
         }
     }
 
-    // Dynamic principal: if the user recorded real manual deposits, use their real total!
-    // Otherwise fallback to the TR_BASE_PRINCIPAL environment variable.
-    let principal = if manual_sum > Decimal::ZERO {
-        manual_sum
-    } else {
-        fallback_base
-    };
+    // ── Step 2: Day-by-Day Interest Accrual for Current Month ─────────────────
+    let last_accrual_day = today.pred_opt().unwrap_or(today);
+    let mut current_month_accrued = Decimal::ZERO;
+    let mut d = first_of_current_month;
 
-    if principal <= Decimal::ZERO {
-        debug!("[PT-Wealth-Hub] Trade Republic principal is zero, skipping interest calculation");
-        return Ok(());
+    while d <= last_accrual_day {
+        let bal = compute_balance_on_date(&manual_activities, d, fallback_base);
+        if bal > Decimal::ZERO {
+            current_month_accrued += bal * (tanb_rate / Decimal::from(100)) / Decimal::from(360);
+        }
+        if let Some(next) = d.succ_opt() {
+            d = next;
+        } else {
+            break;
+        }
     }
-
-    let days_elapsed = (today - start_date).num_days().max(0) as u32;
-
-    // Daily interest formula (ACT/360 as used by Trade Republic & EU banks):
-    // interest = principal * (tanb_rate / 100) / 360 * days_elapsed
-    let rate_factor =
-        (tanb_rate / Decimal::from(100)) / Decimal::from(360) * Decimal::from(days_elapsed);
-    let mut interest = (principal * rate_factor).round_dp(2);
 
     if display_mode == "net" {
-        // 28% IRS withholding tax in Portugal
-        interest = (interest * Decimal::new(72, 2)).round_dp(2);
+        current_month_accrued = (current_month_accrued * Decimal::new(72, 2)).round_dp(2);
+    } else {
+        current_month_accrued = current_month_accrued.round_dp(2);
     }
 
+    let today_balance = compute_balance_on_date(&manual_activities, today, fallback_base);
+    let mut daily_rate =
+        (today_balance * (tanb_rate / Decimal::from(100)) / Decimal::from(360)).round_dp(2);
+    if display_mode == "net" {
+        daily_rate = (daily_rate * Decimal::new(72, 2)).round_dp(2);
+    }
+
+    // ── Step 3: Update Account Balances in Wealthfolio ────────────────────────
     if account.tracking_mode == TrackingMode::Holdings {
-        // In Holdings mode, set the snapshot cash balance
-        let total = principal + interest;
+        let total = today_balance + current_month_accrued;
         let mut cash_balances = std::collections::HashMap::new();
         cash_balances.insert(account.currency.clone(), total);
         let snapshot = AccountStateSnapshot {
@@ -192,25 +280,25 @@ async fn sync_trade_republic(state: &Arc<AppState>) -> anyhow::Result<()> {
             .await?;
 
         info!(
-            "[PT-Wealth-Hub] Trade Republic snapshot updated: {:.2} {} (Base: {:.2}, Juros: {:.2})",
-            total, account.currency, principal, interest
+            "[PT-Wealth-Hub] Trade Republic snapshot updated: {:.2} {} (Saldo base: {:.2}, Juros decorrentes: {:.2})",
+            total, account.currency, today_balance, current_month_accrued
         );
     } else {
-        // In Transactions mode, keep manual deposits untouched and credit only the interest
-        if interest == existing_interest_amount && !old_auto_tr_ids.is_empty() {
+        // In Transactions mode, keep all deposits intact and update the accrual entry
+        if current_month_accrued == existing_temp_amount && !old_temp_auto_ids.is_empty() {
             debug!(
-                "[PT-Wealth-Hub] Trade Republic interest up to date ({:.2} {})",
-                interest, account.currency
+                "[PT-Wealth-Hub] Trade Republic interest up to date (+{:.2} {})",
+                current_month_accrued, account.currency
             );
             return Ok(());
         }
 
-        // Remove old auto-generated interest entries
-        for old_id in old_auto_tr_ids {
+        // Remove old temporary month accrual activity
+        for old_id in old_temp_auto_ids {
             let _ = state.activity_service.delete_activity(old_id).await;
         }
 
-        if interest > Decimal::ZERO {
+        if current_month_accrued > Decimal::ZERO {
             let activity = NewActivity {
                 id: None,
                 account_id: account.id.clone(),
@@ -223,11 +311,16 @@ async fn sync_trade_republic(state: &Arc<AppState>) -> anyhow::Result<()> {
                 currency: account.currency.clone(),
                 fee: None,
                 tax: None,
-                amount: Some(interest),
+                amount: Some(current_month_accrued),
                 status: Some(ActivityStatus::Posted),
                 notes: Some(format!(
-                    "[Auto-TR] Juros Acumulados (Base: {:.2} {}, {} dias a {:.2}% TANB)",
-                    principal, account.currency, days_elapsed, tanb_rate
+                    "[Auto-TR] Juros a Decorrer ({:02}/{}): +{:.2} {} (~{:.2} {}/dia)",
+                    today.month(),
+                    today.year(),
+                    current_month_accrued,
+                    account.currency,
+                    daily_rate,
+                    account.currency
                 )),
                 fx_rate: None,
                 metadata: None,
@@ -242,13 +335,44 @@ async fn sync_trade_republic(state: &Arc<AppState>) -> anyhow::Result<()> {
             state.activity_service.create_activity(activity).await?;
 
             info!(
-                "[PT-Wealth-Hub] Trade Republic interest credited: +{:.2} {} (Base principal acumulado: {:.2} {})",
-                interest, account.currency, principal, account.currency
+                "[PT-Wealth-Hub] Trade Republic juros a decorrer atualizados: +{:.2} {} (~{:.2} {}/dia sobre saldo {:.2} {})",
+                current_month_accrued, account.currency, daily_rate, account.currency, today_balance, account.currency
             );
         }
     }
 
     Ok(())
+}
+
+fn compute_balance_on_date(
+    activities: &[Activity],
+    target_date: NaiveDate,
+    fallback_base: Decimal,
+) -> Decimal {
+    let mut balance = Decimal::ZERO;
+    let mut count = 0;
+
+    for act in activities {
+        if act.activity_date.date_naive() <= target_date {
+            count += 1;
+            let amount = act.amount.unwrap_or(Decimal::ZERO);
+            match act.activity_type.as_str() {
+                "DEPOSIT" | "CREDIT" | "INTEREST" | "DIVIDEND" | "SELL" | "TRANSFER_IN" => {
+                    balance += amount;
+                }
+                "WITHDRAWAL" | "FEE" | "TAX" | "BUY" | "TRANSFER_OUT" => {
+                    balance -= amount;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if count == 0 {
+        fallback_base
+    } else {
+        balance
+    }
 }
 
 // ─── Hyperliquid Auto-Sync ───────────────────────────────────────────────────
